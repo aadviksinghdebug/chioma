@@ -7,6 +7,7 @@ use soroban_sdk::testutils::Address as _;
 use soroban_sdk::token::StellarAssetClient as TokenAdminClient;
 use soroban_sdk::{Address, Env};
 
+use crate::errors::EscrowError;
 use crate::escrow_impl::{EscrowContract, EscrowContractClient};
 use crate::types::{EscrowStatus, TimeoutConfig};
 
@@ -654,4 +655,300 @@ fn test_admin_can_unfreeze_and_release() {
     let result = client.try_unfreeze_escrow(&escrow_id, &admin);
     assert!(result.is_ok(), "admin should be able to unfreeze escrow");
     assert!(!client.is_escrow_frozen(&escrow_id));
+}
+
+// ─── Global Pause Tests (#1689) ───────────────────────────────────────────────
+//
+// escrow already had per-escrow freeze; these tests cover the separate
+// contract-wide pause: an authorized emergency stop of ALL state-changing
+// entry points (not just one escrow), while reads remain available.
+
+#[test]
+fn test_admin_can_pause_and_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, ..) = setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize_admin(&admin);
+
+    assert!(!client.is_paused());
+
+    let result = client.try_pause(&admin);
+    assert!(result.is_ok(), "admin should be able to pause");
+    assert!(client.is_paused());
+
+    let result = client.try_unpause(&admin);
+    assert!(result.is_ok(), "admin should be able to unpause");
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_non_admin_cannot_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, ..) = setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize_admin(&admin);
+
+    let outsider = Address::generate(&env);
+    let result = client.try_pause(&outsider);
+    assert_eq!(result, Err(Ok(EscrowError::NotAuthorized)));
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_non_admin_cannot_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, ..) = setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize_admin(&admin);
+    client.pause(&admin);
+
+    let outsider = Address::generate(&env);
+    let result = client.try_unpause(&outsider);
+    assert_eq!(result, Err(Ok(EscrowError::NotAuthorized)));
+    assert!(client.is_paused());
+}
+
+#[test]
+fn test_double_pause_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, ..) = setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize_admin(&admin);
+    client.pause(&admin);
+
+    let result = client.try_pause(&admin);
+    assert_eq!(result, Err(Ok(EscrowError::ContractPaused)));
+}
+
+#[test]
+fn test_unpause_when_not_paused_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, ..) = setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize_admin(&admin);
+
+    let result = client.try_unpause(&admin);
+    assert_eq!(result, Err(Ok(EscrowError::NotPaused)));
+}
+
+#[test]
+fn test_create_blocked_while_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, depositor, beneficiary, arbiter, platform_governance, agent_referral, token) =
+        setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize_admin(&admin);
+    client.pause(&admin);
+
+    let result = client.try_create(
+        &depositor,
+        &beneficiary,
+        &arbiter,
+        &platform_governance,
+        &agent_referral,
+        &1000,
+        &token,
+    );
+    assert_eq!(result, Err(Ok(EscrowError::ContractPaused)));
+}
+
+#[test]
+fn test_fund_escrow_blocked_while_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, depositor, beneficiary, arbiter, platform_governance, agent_referral, token) =
+        setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize_admin(&admin);
+
+    let escrow_id = client.create(
+        &depositor,
+        &beneficiary,
+        &arbiter,
+        &platform_governance,
+        &agent_referral,
+        &1000,
+        &token,
+    );
+    let token_admin_client = TokenAdminClient::new(&env, &token);
+    token_admin_client.mint(&depositor, &1000);
+
+    client.pause(&admin);
+
+    let result = client.try_fund_escrow(&escrow_id, &depositor);
+    assert_eq!(result, Err(Ok(EscrowError::ContractPaused)));
+}
+
+#[test]
+fn test_approve_release_blocked_while_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, depositor, beneficiary, arbiter, platform_governance, agent_referral, token) =
+        setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize_admin(&admin);
+
+    let escrow_id = funded_escrow(
+        &env,
+        &client,
+        &depositor,
+        &beneficiary,
+        &arbiter,
+        &platform_governance,
+        &agent_referral,
+        &token,
+        1000,
+    );
+
+    client.pause(&admin);
+
+    let result = client.try_approve_release(&escrow_id, &depositor, &beneficiary);
+    assert_eq!(result, Err(Ok(EscrowError::ContractPaused)));
+}
+
+#[test]
+fn test_initiate_dispute_blocked_while_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, depositor, beneficiary, arbiter, platform_governance, agent_referral, token) =
+        setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize_admin(&admin);
+
+    let escrow_id = funded_escrow(
+        &env,
+        &client,
+        &depositor,
+        &beneficiary,
+        &arbiter,
+        &platform_governance,
+        &agent_referral,
+        &token,
+        1000,
+    );
+
+    client.pause(&admin);
+
+    let reason = soroban_sdk::String::from_str(&env, "disputed while paused");
+    let result = client.try_initiate_dispute(&escrow_id, &depositor, &reason);
+    assert_eq!(result, Err(Ok(EscrowError::ContractPaused)));
+}
+
+#[test]
+fn test_reads_remain_available_while_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, depositor, beneficiary, arbiter, platform_governance, agent_referral, token) =
+        setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize_admin(&admin);
+
+    let escrow_id = funded_escrow(
+        &env,
+        &client,
+        &depositor,
+        &beneficiary,
+        &arbiter,
+        &platform_governance,
+        &agent_referral,
+        &token,
+        1000,
+    );
+
+    client.pause(&admin);
+
+    // Reads must keep working while the contract is paused.
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Funded);
+    assert_eq!(client.get_admin(), Some(admin));
+    assert!(client.is_paused());
+    assert!(!client.is_escrow_frozen(&escrow_id));
+}
+
+#[test]
+fn test_unpausing_restores_normal_operation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, depositor, beneficiary, arbiter, platform_governance, agent_referral, token) =
+        setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize_admin(&admin);
+
+    let escrow_id = funded_escrow(
+        &env,
+        &client,
+        &depositor,
+        &beneficiary,
+        &arbiter,
+        &platform_governance,
+        &agent_referral,
+        &token,
+        1000,
+    );
+
+    client.pause(&admin);
+    let blocked = client.try_approve_release(&escrow_id, &depositor, &beneficiary);
+    assert_eq!(blocked, Err(Ok(EscrowError::ContractPaused)));
+
+    client.unpause(&admin);
+    let result = client.try_approve_release(&escrow_id, &depositor, &beneficiary);
+    assert!(result.is_ok(), "operations should resume after unpause");
+}
+
+#[test]
+fn test_admin_can_still_freeze_and_unfreeze_while_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, depositor, beneficiary, arbiter, platform_governance, agent_referral, token) =
+        setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize_admin(&admin);
+
+    let escrow_id = funded_escrow(
+        &env,
+        &client,
+        &depositor,
+        &beneficiary,
+        &arbiter,
+        &platform_governance,
+        &agent_referral,
+        &token,
+        1000,
+    );
+
+    client.pause(&admin);
+
+    // Emergency per-escrow freeze/unfreeze must still work while the whole
+    // contract is paused, since both are themselves admin-controlled
+    // emergency mechanisms, not regular state-changing operations.
+    let reason = soroban_sdk::String::from_str(&env, "freeze during pause");
+    let result = client.try_freeze_escrow(&escrow_id, &admin, &reason);
+    assert!(
+        result.is_ok(),
+        "admin should still be able to freeze while paused"
+    );
+
+    let result = client.try_unfreeze_escrow(&escrow_id, &admin);
+    assert!(
+        result.is_ok(),
+        "admin should still be able to unfreeze while paused"
+    );
 }

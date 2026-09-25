@@ -31,6 +31,9 @@ impl DisputeHandler {
         caller: Address,
         reason: String,
     ) -> Result<(), EscrowError> {
+        // CHECKS: Contract must not be paused (#1689)
+        AccessControl::require_not_paused(&env)?;
+
         // CHECKS: Get and validate escrow
         let mut escrow = EscrowStorage::get(&env, &escrow_id).ok_or(EscrowError::EscrowNotFound)?;
 
@@ -139,6 +142,8 @@ impl DisputeHandler {
     /// Resolve a disputed escrow automatically when dispute timeout is reached.
     /// On timeout, funds are refunded to depositor.
     pub fn resolve_dispute_on_timeout(env: Env, escrow_id: BytesN<32>) -> Result<(), EscrowError> {
+        AccessControl::require_not_paused(&env)?;
+
         let mut escrow = EscrowStorage::get(&env, &escrow_id).ok_or(EscrowError::EscrowNotFound)?;
 
         if escrow.status != EscrowStatus::Disputed {

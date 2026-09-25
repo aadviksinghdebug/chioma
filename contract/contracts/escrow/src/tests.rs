@@ -2019,3 +2019,97 @@ fn test_withdraw_safety_deposit_only_depositor_can_call() {
     let result = client.try_withdraw_safety_deposit(&escrow_id, &beneficiary);
     assert!(result.is_err());
 }
+
+#[test]
+fn test_release_history_bounded_by_max() {
+    use crate::storage::EscrowStorage;
+    use crate::types::ReleaseRecord;
+    use soroban_sdk::contract;
+
+    #[contract]
+    struct TestContract;
+
+    let env = Env::default();
+    let contract_id = env.register(TestContract, ());
+    let escrow_id = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+    let recipient = Address::generate(&env);
+
+    // Appending well past MAX_RELEASE_HISTORY (64) must not let the list
+    // grow unbounded (#1683): the oldest entries are dropped instead.
+    env.as_contract(&contract_id, || {
+        for i in 0..100u32 {
+            EscrowStorage::add_release_record(
+                &env,
+                &escrow_id,
+                ReleaseRecord {
+                    escrow_id: escrow_id.clone(),
+                    amount: i as i128,
+                    recipient: recipient.clone(),
+                    released_at: env.ledger().timestamp(),
+                    reason: soroban_sdk::String::from_str(&env, "partial"),
+                },
+            );
+        }
+    });
+
+    let history = env.as_contract(&contract_id, || {
+        EscrowStorage::get_release_history(&env, &escrow_id)
+    });
+
+    assert_eq!(history.len(), 64);
+    // The oldest 36 records (amount 0..=35) should have been evicted,
+    // leaving the most recent 64 (amount 36..=99).
+    assert_eq!(history.get(0).unwrap().amount, 36);
+    assert_eq!(history.get(63).unwrap().amount, 99);
+}
+
+#[test]
+fn test_save_extends_escrow_ttl() {
+    use crate::storage::EscrowStorage;
+    use crate::types::{Escrow, EscrowStatus};
+    use soroban_sdk::testutils::storage::Persistent as _;
+    use soroban_sdk::{contract, BytesN};
+
+    #[contract]
+    struct TestContract;
+
+    let env = Env::default();
+    let contract_id = env.register(TestContract, ());
+    let escrow_id = BytesN::from_array(&env, &[3u8; 32]);
+    let party = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let escrow = Escrow {
+        id: escrow_id.clone(),
+        depositor: party.clone(),
+        beneficiary: party.clone(),
+        arbiter: party.clone(),
+        platform_governance: party.clone(),
+        agent_referral: party.clone(),
+        amount: 1000,
+        token,
+        status: EscrowStatus::Pending,
+        created_at: env.ledger().timestamp(),
+        timeout_days: 14,
+        disputed_at: None,
+        dispute_reason: None,
+        is_frozen: false,
+        frozen_at: None,
+        freeze_reason: None,
+    };
+
+    // save() must extend the entity's TTL (#1683): before this fix, only
+    // rate-limit and upgrade keys ever called extend_ttl, so an escrow
+    // that received no further writes could be archived out from under an
+    // open, funded position.
+    let ttl = env.as_contract(&contract_id, || {
+        EscrowStorage::save(&env, &escrow);
+        let key = crate::types::DataKey::Escrow(escrow_id.clone());
+        env.storage().persistent().get_ttl(&key)
+    });
+
+    assert!(
+        ttl >= 499_000,
+        "expected the escrow key's TTL to be bumped close to the 500_000-ledger threshold, got {ttl}"
+    );
+}
